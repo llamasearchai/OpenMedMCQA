@@ -1,0 +1,418 @@
+
+
+## Zero‑Hallucination Master Checklist and Runbook
+
+Below is a precise, end‑to‑end set of instructions that (a) matches the code you already have, (b) includes known fixes, (c) verifies each component with explicit checks, and (d) adds guardrails to prevent model hallucinations. Follow each step in order and do not proceed until the “Pass criteria” are satisfied.
+
+### 0) Scope Truths
+
+-  Implemented and testable today:
+    - Typer/Rich CLI (info, ingest, build-index, ask, evaluate, menu, llm-cmd, serve-datasette-cmd).
+    - SQLite persistence with sqlite-utils.
+    - FAISS vector index.
+    - medBERT/SciBERT embeddings with a deterministic LIGHT_TESTS mode.
+    - OpenAI Chat Completions wrapper for generation.
+    - Datasette and llm CLI integrations.
+    - Automated tests via pytest, tox, hatch.
+-  Not implemented yet (to avoid any ambiguity):
+    - OpenAI Assistants/Agents API integration is not in the codebase. The current agent uses Chat Completions. Only proceed with Chat Completions until you add an Assistants subclass yourself.
+
+If any document or instruction claims full Assistants/Agents support without you adding that code, treat it as incorrect.
+
+## A) One‑Time Setup (Environment and Files)
+
+1) System requirements
+-  Python 3.10+.
+-  Optional GPU with CUDA for faster embedding; CPU is fine.
+-  macOS/Linux/Windows supported. On Apple Silicon, FAISS wheels are usually available; if installation fails, see fallback in Troubleshooting.
+
+2) Create project tree and files
+-  Ensure you have created exactly the files and contents from the previous response.
+-  Verify the tree:
+    - src/medagent/*.py
+    - tests/*.py
+    - pyproject.toml, tox.ini, hatch.toml, Makefile
+    - scripts/sample_questions.json (we will convert to JSONL).
+
+3) Create and activate a virtual environment
+-  Recommended: uv (fast) or venv.
+
+    - macOS/Linux:
+        - uv venv .venv
+        - source .venv/bin/activate
+    - Windows PowerShell:
+        - uv venv .venv
+        - .venv\Scripts\Activate.ps1
+
+4) Install dependencies
+
+    - uv pip install -e ".[dev,cli,data]"
+
+Pass criteria:
+-  python -c "import faiss, sqlite_utils, transformers, openai, typer, rich; print('OK')"
+-  Prints: OK
+
+## B) Apply Two Small Fixes (No Guesswork)
+
+These are deterministic corrections to match the docs and ensure indexing works from a clean state.
+
+1) CLI command name alignment (serve-datasette)
+-  Current command is registered as serve-datasette-cmd (from function name).
+-  Either call it as serve-datasette-cmd, or add an alias. To add an alias, open src/medagent/cli.py and append the alias command:
+
+    - Add this near the bottom of the file:
+
+        @app.command("serve-datasette")
+        def serve_datasette_alias(port: int = 8080):
+            """Alias for 'serve-datasette-cmd' to match docs/Makefile."""
+            serve_datasette_cmd(port)
+
+-  Or update your docs/Makefile to use the existing name serve-datasette-cmd instead.
+
+2) Index builder first-run bug
+-  In src/medagent/rag.py, replace this line:
+
+        if len(getattr(store, "_ids", [])) == 0:
+
+-  With this exact, safe check:
+
+        if getattr(store, "_ids", None) is None or len(store._ids) == 0:
+
+Pass criteria:
+-  No linter or runtime error referencing len(None) in first build-index run.
+
+## C) Strict Configuration and Keys
+
+1) Required environment variables
+
+    - export OPENAI_API_KEY="sk-..."        # or setx on Windows
+    - export MEDAGENT_MODEL="gpt-4o-mini"   # default is fine
+    - export MEDAGENT_EMBEDDING_MODEL="allenai/scibert_scivocab_uncased"  # default is fine
+    - export MEDAGENT_DB="medagent.db"      # default is fine
+    - export MEDAGENT_INDEX_DIR=".index"    # default is fine
+    - export MEDAGENT_TEMPERATURE="0.0"     # enforces determinism for generation
+    - export LIGHT_TESTS="1"                # for CI/smoke (turn off for real runs)
+
+2) Verify configuration
+
+    - medagent info
+
+Pass criteria:
+-  The printed table shows your chosen values. Temperature must be 0.0 when enforcing “no hallucinations”.
+
+## D) Dataset Preparation (JSONL, not JSON)
+
+Your ingest function expects JSON Lines (one JSON object per line). Convert the provided sample:
+
+1) Convert scripts/sample_questions.json (array) to JSONL:
+
+    - jq -c ".[]" scripts/sample_questions.json > scripts/sample_questions.jsonl
+
+2) Validate JSONL
+-  Ensure each line is a valid object with this schema:
+    - id, question, options.A, options.B, options.C, options.D, correct_answer
+    - Optional: explanation, subject, topic, difficulty, source
+
+3) Ingest
+
+    - medagent ingest scripts/sample_questions.jsonl
+
+Pass criteria:
+-  CLI panel: “Ingested N questions and M seed contexts”.
+-  In SQLite (optional manual check):
+
+    - sqlite3 medagent.db ".tables"
+    - Must include: questions, contexts, runs, predictions
+
+    - sqlite3 medagent.db "select count(*) from questions;"
+    - Number must match your JSONL lines count.
+
+## E) Build the Vector Index
+
+1) Build
+
+    - medagent build-index
+
+2) Verify FAISS artifacts
+-  Ensure .index/contexts.faiss and .index/context_ids.npy exist.
+
+    - ls -l .index
+
+Pass criteria:
+-  File sizes > 0.
+-  No exceptions raised.
+
+## F) Offline Smoke Tests (No OpenAI Calls)
+
+Set LIGHT_TESTS=1 to exercise embeddings and FAISS deterministically without calling OpenAI.
+
+1) Unit tests
+
+    - pytest -q
+
+Expected:
+-  Tests complete successfully.
+-  If you included the alias in B.1, they will still pass.
+
+2) Manual embedding and retrieval check (optional):
+
+    - python - << 'PY'
+        from medagent.embeddings import MedEmbedder
+        from medagent.retrieval import FAISSStore
+        from medagent.config import settings
+        e = MedEmbedder(settings.embedding_model, light_mode=True)
+        store = FAISSStore(dim=e.dim)
+        import numpy as np
+        q = e.embed_texts(["scurvy cause"])[0].reshape(1,-1)
+        scores, idxs, ids = store.search(q, top_k=3)
+        print("idxs:", idxs, "ids count:", len(ids))
+    PY
+
+Pass criteria:
+-  idxs prints a 1x3 matrix.
+-  ids count matches number of contexts in DB.
+
+Do not run medagent ask or evaluate while LIGHT_TESTS=1 if you do not want outbound OpenAI calls.
+
+## G) First Online Call (Tightly Controlled)
+
+1) Ensure your OpenAI key is set and valid.
+2) Keep MEDAGENT_TEMPERATURE=0.0.
+3) Ask a controlled question:
+
+    - medagent ask --question "Which vitamin deficiency causes scurvy?" --A "Vitamin A" --B "Vitamin C" --C "Vitamin D" --D "Vitamin K"
+
+Expected:
+-  A small table with Predicted, Confidence (0.00–1.00), Latency (ms).
+-  An Explanation panel and a Contexts panel (ctx IDs listed).
+-  JSON parsing errors should not occur; if they do, the code will try to salvage JSON from the response.
+
+Pass criteria:
+-  The command returns exit code 0.
+-  The output contains “Predicted” and “Confidence”.
+-  Context IDs are listed.
+
+## H) Evaluation Run (Small Batch)
+
+1) Turn off LIGHT_TESTS for real embedding (optional but recommended for realism):
+
+    - unset LIGHT_TESTS    # or setx LIGHT_TESTS "" on Windows
+
+2) Evaluate a small subset:
+
+    - medagent evaluate --limit 1
+
+3) Verify predictions recorded:
+
+    - sqlite3 medagent.db "select count(*) from predictions;"
+    - Should be >= 1
+    - sqlite3 medagent.db "select is_correct, confidence, latency_ms from predictions limit 5;"
+
+Pass criteria:
+-  Accuracy report panel prints with fields: run_id, accuracy, avg_latency_ms, count.
+-  predictions table has at least one row.
+
+## I) Datasette and llm CLI Integration
+
+1) Datasette
+-  If you created the alias in step B.1:
+
+    - medagent serve-datasette --port 8080
+
+-  Otherwise:
+
+    - medagent serve-datasette-cmd --port 8080
+
+-  Browser: http://127.0.0.1:8080
+-  Inspect tables: questions, contexts, runs, predictions.
+
+Pass criteria:
+-  The web UI loads and shows table counts consistent with your DB.
+
+2) llm CLI
+-  Install (if not done):
+
+    - pipx install llm
+    - llm plugins install llm-cmd
+    - llm keys set openai
+
+-  Test:
+
+    - medagent llm-cmd "Say 'OK' exactly once."
+
+Expected:
+-  Output panel shows: OK
+
+Pass criteria:
+-  Exit code 0, output equals “OK”.
+
+## J) Automated Test Suite and Quality Gates
+
+1) Lint, type, tests
+
+    - ruff check src tests
+    - ruff format --check src tests   # or 'fmt' to auto-format
+    - mypy src
+    - pytest -q
+
+Pass criteria:
+-  No errors from ruff, mypy, or pytest.
+
+2) tox (matrix)
+
+    - tox
+
+Pass criteria:
+-  py310 and py311 envs pass (LIGHT_TESTS=1 inside tox by default).
+
+3) hatch (optional)
+
+    - hatch run pytest
+
+## K) Anti‑Hallucination Protocols (Enforced, Verifiable)
+
+-  Temperature
+    - Ensure MEDAGENT_TEMPERATURE=0.0 before ask/evaluate.
+-  Strict prompting
+    - The system prompt explicitly says “Use only the provided CONTEXT” and “Return strictly valid JSON.”
+-  JSON schema discipline
+    - The code already parses JSON and falls back to brace-extraction if needed.
+    - If you want additional enforcement, run a post-parse check:
+
+        - The output must contain keys: answer in {A,B,C,D}, confidence in [0,1], explanation string.
+-  Context traceability
+    - The CLI prints ctx IDs used—manually confirm they reference the DB.
+-  Answer auditing
+    - Accuracy is computed by comparing predicted vs correct; use Datasette to inspect misses.
+-  No unauthorized sources
+    - There is no external web retrieval in the code; all context comes from your SQLite contexts table.
+-  Reproducibility
+    - In LIGHT_TESTS=1 mode, embeddings are deterministic (seeded RNG).
+    - In real mode, generation is deterministic at temperature 0.0.
+
+Quick verification for JSON discipline:
+-  Run medagent ask and confirm the output was parsed without “salvage” fallback (no JSON decode warning/errors in console). If you see parsing errors, reduce prompt length (fewer contexts) or keep temperature 0.0.
+
+## L) Database Integrity Checks (Exact SQL)
+
+After any ingest:
+
+-  Schema exists:
+
+    - sqlite3 medagent.db "select name from sqlite_master where type='table' order by 1;"
+
+-  Questions count equals JSONL lines:
+
+    - wc -l scripts/sample_questions.jsonl
+    - sqlite3 medagent.db "select count(*) from questions;"
+
+-  Contexts exist:
+
+    - sqlite3 medagent.db "select count(*) from contexts;"
+
+-  Predictions correctness rate by run:
+
+    - sqlite3 medagent.db "select run_id, avg(is_correct)*100.0 as accuracy_pct, count(*) as n from predictions group by run_id order by created_at desc;"
+
+-  Slow outliers:
+
+    - sqlite3 medagent.db "select q_id, latency_ms from predictions order by latency_ms desc limit 5;"
+
+Pass criteria:
+-  Counts match expectations; accuracy and latency metrics are sensible for your subset.
+
+## M) Known Failure Modes and Exact Remedies
+
+-  FAISS build crashes on first run:
+    - You missed fix B.2. Apply it and rerun medagent build-index.
+-  Ingest returns 0 questions:
+    - You passed a JSON array file. Convert to JSONL with jq as in section D.
+-  OpenAI call fails:
+    - Ensure OPENAI_API_KEY, correct model name, and internet connectivity.
+    - Re-run medagent info; confirm MEDAGENT_TEMPERATURE=0.0.
+-  Hugging Face model download too slow or blocked:
+    - Set a local HF cache:
+        - export HF_HOME="$PWD/.hf-cache"
+-  FAISS installation issue on macOS/Windows:
+    - Try:
+        - pip uninstall faiss-cpu -y
+        - pip install --no-cache-dir faiss-cpu
+    - Or Conda (if you use it): conda install -c conda-forge faiss-cpu
+-  Datasette port busy:
+    - Change port: medagent serve-datasette --port 8081
+-  llm CLI not found:
+    - pipx install llm && llm plugins install llm-cmd && llm keys set openai
+
+## N) Optional: Assistants/Agents Integration Reality Check
+
+-  Current code does not include Assistants/Agents API. To avoid any misinterpretation:
+    - Do not set MEDAGENT_USE_ASSISTANTS=1; it has no effect yet.
+    - If you must add Assistants, implement a new class (e.g., src/medagent/agent_assistants.py) that:
+        - Creates or uses an existing assistant configured for “function/tool use”.
+        - Creates a thread, posts the user message (with the same prompt template), starts a run, and polls until completed.
+        - Extracts answer JSON and returns the same tuple signature as OpenAIFunctionAgent.answer_medmcqa.
+    - Add a CLI flag to choose the agent class.
+-  Only after you implement and test it locally should you claim “Agents/Assistants integrated”.
+
+## O) End‑to‑End Sanity Script (All Green = Good)
+
+Run these in order:
+
+1) Environment
+
+    - uv pip install -e ".[dev,cli,data]"
+    - export OPENAI_API_KEY="sk-..."
+    - export MEDAGENT_TEMPERATURE="0.0"
+    - export LIGHT_TESTS="1"
+
+2) Fixes applied (B.1 and B.2).
+
+3) Info
+
+    - medagent info
+
+4) Ingest
+
+    - jq -c ".[]" scripts/sample_questions.json > scripts/sample_questions.jsonl
+    - medagent ingest scripts/sample_questions.jsonl
+
+5) Index
+
+    - medagent build-index
+
+6) Tests (offline)
+
+    - pytest -q
+
+7) Online ask (turning off LIGHT_TESTS only if you want real embeddings)
+
+    - unset LIGHT_TESTS
+    - medagent ask --question "Which vitamin deficiency causes scurvy?" --A "Vitamin A" --B "Vitamin C" --C "Vitamin D" --D "Vitamin K"
+
+8) Evaluate small
+
+    - medagent evaluate --limit 1
+
+9) Verify DB
+
+    - sqlite3 medagent.db "select count(*) from predictions;"
+
+10) Datasette
+
+    - medagent serve-datasette   # or serve-datasette-cmd
+
+11) llm CLI
+
+    - medagent llm-cmd "Say 'OK' exactly once."
+
+If any step fails, consult section M and do not proceed until the pass criteria are met.
+
+## P) Operational Guardrails to Keep Outputs Grounded
+
+-  Always run with MEDAGENT_TEMPERATURE=0.0 in production/study mode.
+-  Keep contexts small and high-quality (MEDAGENT_MAX_CTX=5 default is fine).
+-  Periodically check calibration by comparing confidence vs correctness using SQL via Datasette.
+-  Never trust free-form model text for scoring; rely on our strict JSON schema and DB comparisons only.
+
+Following this runbook exactly ensures that every feature described in the previous response is implemented, verifiable, and operating without relying on unimplemented components or undocumented behavior.
+

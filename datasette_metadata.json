@@ -1,0 +1,23 @@
+{
+  "title": "MedAgent DB",
+  "description": "Canned queries for predictions and runs",
+  "databases": {
+    "medagent": {
+      "queries": {
+        "accuracy_by_run": {
+          "title": "Accuracy by Run",
+          "sql": "SELECT run_id, ROUND(AVG(is_correct), 4) AS accuracy, COUNT(*) AS n FROM predictions GROUP BY run_id ORDER BY accuracy DESC"
+        },
+        "accuracy_by_subject": {
+          "title": "Accuracy by Subject",
+          "sql": "SELECT q.subject, ROUND(AVG(p.is_correct), 4) AS accuracy, COUNT(*) AS n FROM predictions p JOIN questions q ON p.q_id = q.id GROUP BY q.subject ORDER BY n DESC"
+        },
+        "latency_histogram": {
+          "title": "Latency Histogram",
+          "sql": "SELECT CAST(latency_ms/100 AS INT)*100 AS bucket_ms, COUNT(*) AS n FROM predictions GROUP BY bucket_ms ORDER BY bucket_ms"
+        }
+      }
+    }
+  }
+}
+

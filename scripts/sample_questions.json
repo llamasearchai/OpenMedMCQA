@@ -1,0 +1,20 @@
+[
+    {
+        "id": "s1",
+        "question": "Which vitamin deficiency causes scurvy?",
+        "options": {
+            "A": "Vitamin A",
+            "B": "Vitamin C",
+            "C": "Vitamin D",
+            "D": "Vitamin K"
+        },
+        "correct_answer": "B",
+        "explanation": "Scurvy is caused by vitamin C deficiency.",
+        "subject": "Biochemistry",
+        "topic": "Vitamins",
+        "difficulty": "easy",
+        "source": "sample"
+    }
+]
+
+

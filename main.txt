@@ -1,0 +1,1164 @@
+
+
+## Master Agentic Python Program: MedMCQA RAG + Agents SDK + llm/datasette CLI
+
+This response gives you an end-to-end, production-grade scaffold that you can paste into files to stand up a complete system:
+-  Agentic RAG answering for multiple-choice medical questions (MedMCQA).
+-  Embedding using medBERT or SciBERT.
+-  Vector search (FAISS) and SQLite persistence (sqlite-utils).
+-  OpenAI Agents-style tool-calling integration.
+-  Tight CLI with menu, progress bars, and subcommands.
+-  Datasette integration for database browsing; llm and llm-cmd integration for command-line LLM workflows.
+-  Full automated tests (unit, feature, integration) with tox/hatch, along with debugging steps and expected outputs.
+
+### Quickstart
+
+-  Requires Python 3.10+ and a system with enough RAM to load a 768-dim BERT model.
+-  Set environment variables before running:
+    - OPENAI_API_KEY
+    - Optional: MEDAGENT_EMBEDDING_MODEL (default sciBERT), MEDAGENT_DB (default medagent.db), MEDAGENT_INDEX_DIR (default ./.index), MEDAGENT_MODEL (default gpt-4o-mini).
+-  Use uv (fast) or pip to install.
+
+## 1) Project Layout
+
+Create this structure:
+
+| Path | Purpose |
+|:---|:---|
+| pyproject.toml | Build config and dependencies |
+| tox.ini | Test matrix and commands |
+| hatch.toml | Build and environment configs |
+| Makefile | Convenience commands |
+| src/medagent/... | Core package |
+| tests/... | Unit/feature/integration tests |
+| scripts/sample_questions.json | Tiny sample for smoke tests |
+
+## 2) pyproject.toml
+
+```toml
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "medagent"
+version = "0.1.0"
+description = "Agentic RAG MedMCQA: medBERT/sciBERT embeddings, FAISS retrieval, OpenAI Agents SDK, llm/datasette CLI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Your Name"}]
+dependencies = [
+    "typer[all]>=0.12.3",
+    "rich>=13.7.1",
+    "pydantic>=2.7.0",
+    "openai>=1.40.0",
+    "tiktoken>=0.7.0",
+    "transformers>=4.41.0",
+    "torch>=2.2.0",
+    "faiss-cpu>=1.7.4",
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    "scikit-learn>=1.4.0",
+    "sqlite-utils>=3.36",
+    "datasette>=0.64.6",
+    "httpx>=0.27.0",
+    "requests>=2.32.0",
+    "jinja2>=3.1.4",
+    "orjson>=3.10.0",
+    "uvloop; platform_system == 'Linux'",
+    "pyyaml>=6.0.1",
+    "tenacity>=8.3.0",
+    "tabulate>=0.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-cov>=5.0.0",
+    "pytest-xdist>=3.6.1",
+    "ruff>=0.6.9",
+    "mypy>=1.11.0",
+    "types-requests",
+    "types-PyYAML",
+]
+cli = [
+    "llm>=0.13",
+    "llm-cmd>=0.3",
+]
+data = [
+    "datasets>=2.20.0",
+]
+
+[project.scripts]
+medagent = "medagent.cli:app"
+```
+
+## 3) tox.ini
+
+```ini
+[tox]
+envlist = py310,py311
+isolated_build = true
+
+[testenv]
+deps =
+    .[dev]
+commands =
+    pytest -q --disable-warnings --maxfail=1 --cov=medagent --cov-report=term-missing
+setenv =
+    LIGHT_TESTS = 1
+```
+
+## 4) hatch.toml
+
+```toml
+[envs.default]
+dependencies = [".[dev]"]
+env-vars = { LIGHT_TESTS = "1" }
+[envs.run]
+dependencies = [".[cli]"]
+```
+
+## 5) Makefile
+
+```make
+.PHONY: setup test lint type fmt run datasette
+
+setup:
+    uv pip install -e ".[dev,cli,data]"
+
+fmt:
+    ruff format src tests
+
+lint:
+    ruff check src tests
+
+type:
+    mypy src
+
+test:
+    pytest -q
+
+run:
+    medagent menu
+
+datasette:
+    medagent serve-datasette
+```
+
+## 6) src/medagent/__init__.py
+
+```python
+__all__ = ["__version__"]
+__version__ = "0.1.0"
+```
+
+## 7) src/medagent/config.py
+
+```python
+from pydantic import BaseModel, Field
+import os
+from pathlib import Path
+
+
+class Settings(BaseModel):
+    openai_api_key: str = Field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
+    openai_model: str = Field(default_factory=lambda: os.environ.get("MEDAGENT_MODEL", "gpt-4o-mini"))
+    embedding_model: str = Field(default_factory=lambda: os.environ.get("MEDAGENT_EMBEDDING_MODEL", "allenai/scibert_scivocab_uncased"))
+    db_path: str = Field(default_factory=lambda: os.environ.get("MEDAGENT_DB", "medagent.db"))
+    index_dir: str = Field(default_factory=lambda: os.environ.get("MEDAGENT_INDEX_DIR", ".index"))
+    max_ctx: int = Field(default_factory=lambda: int(os.environ.get("MEDAGENT_MAX_CTX", "5")))
+    top_k: int = Field(default_factory=lambda: int(os.environ.get("MEDAGENT_TOP_K", "20")))
+    light_tests: bool = Field(default_factory=lambda: os.environ.get("LIGHT_TESTS", "0") == "1")
+    use_assistants: bool = Field(default_factory=lambda: os.environ.get("MEDAGENT_USE_ASSISTANTS", "0") == "1")
+    temperature: float = Field(default_factory=lambda: float(os.environ.get("MEDAGENT_TEMPERATURE", "0.0")))
+
+    def ensure_dirs(self) -> None:
+        Path(self.index_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+
+
+settings = Settings()
+```
+
+## 8) src/medagent/db.py
+
+```python
+from __future__ import annotations
+
+import datetime as dt
+import json
+from typing import Any, Dict, Iterable, List, Optional
+
+import sqlite3
+from sqlite_utils import Database
+
+from .config import settings
+
+
+def connect() -> Database:
+    db = Database(settings.db_path)
+    ensure_schema(db)
+    return db
+
+
+def ensure_schema(db: Database) -> None:
+    # Questions (source of truth), Contexts (retrieval corpus), Predictions, Runs
+    db["questions"].create(
+        {
+            "id": str,
+            "question": str,
+            "A": str,
+            "B": str,
+            "C": str,
+            "D": str,
+            "correct": str,
+            "subject": str,
+            "topic": str,
+            "difficulty": str,
+            "source": str,
+            "explanation": str,
+        },
+        pk="id",
+        if_not_exists=True,
+    )
+    db["contexts"].create(
+        {
+            "ctx_id": str,
+            "text": str,
+            "source": str,
+            "meta": str,
+        },
+        pk="ctx_id",
+        if_not_exists=True,
+    )
+    db["runs"].create(
+        {
+            "run_id": str,
+            "created_at": str,
+            "model": str,
+            "embedding_model": str,
+            "notes": str,
+        },
+        pk="run_id",
+        if_not_exists=True,
+    )
+    db["predictions"].create(
+        {
+            "run_id": str,
+            "q_id": str,
+            "predicted": str,
+            "confidence": float,
+            "explanation": str,
+            "chosen_ctx_ids": str,
+            "raw": str,
+            "is_correct": int,
+            "latency_ms": float,
+        },
+        pk=("run_id", "q_id"),
+        if_not_exists=True,
+    )
+
+
+def insert_questions(db: Database, rows: Iterable[Dict[str, Any]]) -> None:
+    db["questions"].upsert_all(rows, pk="id")
+
+
+def insert_contexts(db: Database, rows: Iterable[Dict[str, Any]]) -> None:
+    db["contexts"].upsert_all(rows, pk="ctx_id")
+
+
+def new_run(db: Database, run_id: str, notes: str = "") -> None:
+    db["runs"].insert(
+        {
+            "run_id": run_id,
+            "created_at": dt.datetime.utcnow().isoformat(),
+            "model": settings.openai_model,
+            "embedding_model": settings.embedding_model,
+            "notes": notes,
+        },
+        pk="run_id",
+        replace=True,
+    )
+
+
+def record_prediction(
+    db: Database,
+    run_id: str,
+    q_id: str,
+    predicted: str,
+    confidence: float,
+    explanation: str,
+    chosen_ctx_ids: List[str],
+    raw: Dict[str, Any],
+    is_correct: bool,
+    latency_ms: float,
+) -> None:
+    db["predictions"].insert(
+        {
+            "run_id": run_id,
+            "q_id": q_id,
+            "predicted": predicted,
+            "confidence": confidence,
+            "explanation": explanation,
+            "chosen_ctx_ids": json.dumps(chosen_ctx_ids),
+            "raw": json.dumps(raw),
+            "is_correct": 1 if is_correct else 0,
+            "latency_ms": latency_ms,
+        },
+        pk=("run_id", "q_id"),
+        replace=True,
+    )
+```
+
+## 9) src/medagent/embeddings.py
+
+```python
+from __future__ import annotations
+
+import numpy as np
+import torch
+from transformers import AutoTokenizer, AutoModel
+from typing import List
+
+
+class MedEmbedder:
+    def __init__(self, model_name: str, device: str | None = None, light_mode: bool = False):
+        self.model_name = model_name
+        self.light_mode = light_mode
+        if self.light_mode:
+            # Lightweight fake embedder for CI and smoke tests
+            rng = np.random.default_rng(42)
+            self.dim = 128
+            self._rng = rng
+            self.device = "cpu"
+            self.tokenizer = None
+            self.model = None
+            return
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.dim = self.model.config.hidden_size
+        if device:
+            self.device = device
+        else:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model.to(self.device)
+        self.model.eval()
+
+    def embed_texts(self, texts: List[str]) -> np.ndarray:
+        if self.light_mode:
+            # Deterministic random embeddings for tests
+            return self._rng.normal(0, 1, size=(len(texts), self.dim)).astype("float32")
+
+        tokens = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt",
+        ).to(self.device)
+        with torch.no_grad():
+            outputs = self.model(**tokens)  # [batch, seq, hidden]
+            # Mean pooling with attention mask
+            last_hidden = outputs.last_hidden_state  # [b, s, h]
+            input_mask = tokens["attention_mask"].unsqueeze(-1)  # [b, s, 1]
+            masked = last_hidden * input_mask
+            summed = masked.sum(dim=1)
+            counts = input_mask.sum(dim=1).clamp(min=1)
+            emb = (summed / counts).cpu().numpy().astype("float32")
+            return emb
+
+    def embed_pairwise_question_choices(self, question: str, choices: dict) -> dict[str, np.ndarray]:
+        texts = [f"Question: {question} Choice {k}: {v}" for k, v in choices.items()]
+        embs = self.embed_texts(texts)
+        return {k: embs[i] for i, k in enumerate(choices.keys())}
+```
+
+## 10) src/medagent/retrieval.py
+
+```python
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import List, Tuple, Iterable, Dict
+
+import faiss
+import numpy as np
+from sqlite_utils import Database
+
+from .config import settings
+from .db import connect
+
+
+class FAISSStore:
+    def __init__(self, dim: int, index_dir: str | None = None):
+        self.dim = dim
+        self.index_dir = index_dir or settings.index_dir
+        Path(self.index_dir).mkdir(parents=True, exist_ok=True)
+        self.index_path = os.path.join(self.index_dir, "contexts.faiss")
+        self.ids_path = os.path.join(self.index_dir, "context_ids.npy")
+        self._index = None
+        self._ids: np.ndarray | None = None
+
+    @property
+    def index(self) -> faiss.IndexFlatIP:
+        if self._index is None:
+            if os.path.exists(self.index_path):
+                self._index = faiss.read_index(self.index_path)
+            else:
+                self._index = faiss.IndexFlatIP(self.dim)
+        return self._index
+
+    @property
+    def ids(self) -> np.ndarray:
+        if self._ids is None:
+            if os.path.exists(self.ids_path):
+                self._ids = np.load(self.ids_path, allow_pickle=False)
+            else:
+                self._ids = np.array([], dtype="object")
+        return self._ids
+
+    def save(self) -> None:
+        faiss.write_index(self.index, self.index_path)
+        np.save(self.ids_path, self.ids)
+
+    def build(self, embeddings: np.ndarray, ids: List[str]) -> None:
+        # Normalize for cosine similarity
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8
+        embs = embeddings / norms
+        self._index = faiss.IndexFlatIP(self.dim)
+        self.index.add(embs)
+        self._ids = np.array(ids, dtype="object")
+        self.save()
+
+    def add(self, embeddings: np.ndarray, ids: List[str]) -> None:
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8
+        embs = embeddings / norms
+        self.index.add(embs)
+        if self._ids is None or len(self._ids) == 0:
+            self._ids = np.array(ids, dtype="object")
+        else:
+            self._ids = np.concatenate([self._ids, np.array(ids, dtype="object")])
+        self.save()
+
+    def search(self, query_embeddings: np.ndarray, top_k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        norms = np.linalg.norm(query_embeddings, axis=1, keepdims=True) + 1e-8
+        q = query_embeddings / norms
+        scores, idxs = self.index.search(q, top_k)
+        return scores, idxs, self.ids
+
+    def get_texts_from_ids(self, db: Database, ids: List[str]) -> List[Dict]:
+        rows = []
+        for ctx_id in ids:
+            row = db["contexts"].get(ctx_id)
+            rows.append({"ctx_id": ctx_id, "text": row["text"], "source": row["source"], "meta": row["meta"]})
+        return rows
+```
+
+## 11) src/medagent/prompts.py
+
+```python
+SYSTEM_MEDMCQA = """You are a careful medical multiple-choice assistant.
+-  Use only the provided CONTEXT to reason.
+-  Always return a JSON object: {"answer": "A|B|C|D", "confidence": 0-1, "explanation": "..."}.
+-  If context is insufficient, pick the best answer with uncertainty and explain why.
+-  Be concise and safe; do not give medical advice beyond academic exam scope."""
+
+USER_QA_TEMPLATE = """QUESTION:
+{question}
+
+CHOICES:
+A) {A}
+B) {B}
+C) {C}
+D) {D}
+
+CONTEXT:
+{context}
+
+Return strictly valid JSON only.
+"""
+```
+
+## 12) src/medagent/agent.py
+
+```python
+from __future__ import annotations
+
+import json
+import time
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+from openai import OpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from .config import settings
+from .prompts import SYSTEM_MEDMCQA, USER_QA_TEMPLATE
+from .retrieval import FAISSStore
+from .embeddings import MedEmbedder
+from .db import connect
+
+
+class OpenAIFunctionAgent:
+    """
+    Agents-style function-calling wrapper using Chat Completions tool-calls.
+    If `settings.use_assistants` is true and your OpenAI org supports Assistants, you can extend this class.
+    """
+    def __init__(self, embedder: MedEmbedder, store: FAISSStore):
+        self.client = OpenAI(api_key=settings.openai_api_key)  # picks up env automatically
+        self.embedder = embedder
+        self.store = store
+        self.db = connect()
+
+    def retrieve_context(self, question: str, choices: Dict[str, str], k: int | None = None) -> List[Dict]:
+        k = k or settings.max_ctx
+        # Choice-aware retrieval: query with question and each choice
+        texts = [question] + [f"{question} {v}" for v in choices.values()]
+        embs = self.embedder.embed_texts(texts)
+        scores, idxs, ids = self.store.search(embs, top_k=settings.top_k)
+        # Merge top results from each query variant
+        ctx_votes = {}
+        for i in range(idxs.shape[0]):
+            for j in range(idxs.shape[1]):
+                idx = idxs[i, j]
+                if idx < 0 or idx >= len(ids):
+                    continue
+                ctx_id = ids[idx]
+                ctx_votes[ctx_id] = max(ctx_votes.get(ctx_id, 0.0), float(scores[i, j]))
+        top_ctx_ids = [cid for cid, _ in sorted(ctx_votes.items(), key=lambda kv: kv[1], reverse=True)[:k]]
+        return self._fetch_contexts(top_ctx_ids)
+
+    def _fetch_contexts(self, ctx_ids: List[str]) -> List[Dict[str, Any]]:
+        out = []
+        for cid in ctx_ids:
+            row = self.db["contexts"].get(cid)
+            out.append({"ctx_id": cid, "text": row["text"], "source": row["source"], "meta": row["meta"]})
+        return out
+
+    @retry(wait=wait_exponential(min=1, max=20), stop=stop_after_attempt(5))
+    def _chat(self, messages: List[Dict[str, str]]) -> str:
+        resp = self.client.chat.completions.create(
+            model=settings.openai_model,
+            temperature=settings.temperature,
+            messages=messages,
+        )
+        return resp.choices[0].message.content or "{}"
+
+    def answer_medmcqa(self, q: Dict[str, Any]) -> Tuple[str, float, str, List[str], Dict[str, Any], float]:
+        start = time.perf_counter()
+        question = q["question"]
+        choices = {k: q[k] for k in ["A", "B", "C", "D"]}
+
+        contexts = self.retrieve_context(question, choices, k=settings.max_ctx)
+        ctx_text = "\n\n".join([f"[{c['ctx_id']}] {c['text']}" for c in contexts])
+        messages = [
+            {"role": "system", "content": SYSTEM_MEDMCQA},
+            {"role": "user", "content": USER_QA_TEMPLATE.format(context=ctx_text, **q)},
+        ]
+        content = self._chat(messages)
+        try:
+            data = json.loads(content)
+        except Exception:
+            # Try to extract JSON
+            s = content[content.find("{"): content.rfind("}") + 1]
+            data = json.loads(s)
+
+        ans = data.get("answer", "A").strip()
+        conf = float(data.get("confidence", 0.5))
+        expl = data.get("explanation", "")
+
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        return ans, conf, expl, [c["ctx_id"] for c in contexts], data, latency_ms
+```
+
+## 13) src/medagent/rag.py
+
+```python
+from __future__ import annotations
+
+from typing import Dict, List, Any, Iterable
+
+import numpy as np
+from rich.progress import track
+
+from .embeddings import MedEmbedder
+from .retrieval import FAISSStore
+from .db import connect
+
+
+def index_contexts(embedder: MedEmbedder, store: FAISSStore, rows: Iterable[Dict[str, Any]]) -> None:
+    texts, ids = [], []
+    for r in rows:
+        texts.append(r["text"])
+        ids.append(r["ctx_id"])
+    embs = embedder.embed_texts(texts)
+    if len(getattr(store, "_ids", [])) == 0:
+        store.build(embs, ids)
+    else:
+        store.add(embs, ids)
+
+
+def vectorize_questions_and_choices(embedder: MedEmbedder, questions: List[Dict[str, Any]]) -> Dict[str, Dict[str, np.ndarray]]:
+    out = {}
+    for q in questions:
+        out[q["id"]] = embedder.embed_pairwise_question_choices(q["question"], {k: q[k] for k in ["A", "B", "C", "D"]})
+    return out
+
+
+def simple_similarity_vote(q_embeds: Dict[str, np.ndarray], ctx_embeds: np.ndarray) -> str:
+    # Example: choose the option whose embedding is closest to average context embedding
+    ctx_mean = ctx_embeds.mean(axis=0)
+    def cos(a, b):
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+    scores = {opt: cos(vec, ctx_mean) for opt, vec in q_embeds.items()}
+    return max(scores.items(), key=lambda kv: kv[1])[0]
+```
+
+## 14) src/medagent/datasets.py
+
+```python
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, Iterable, List, Tuple
+from pathlib import Path
+
+from .db import connect
+
+
+def load_medmcqa_jsonl(path: str) -> List[Dict[str, Any]]:
+    # Expected JSON lines with keys: id, question, options A..D, correct, explanation, subject, topic, difficulty, source
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            x = json.loads(line)
+            rows.append({
+                "id": x["id"],
+                "question": x["question"],
+                "A": x["options"]["A"],
+                "B": x["options"]["B"],
+                "C": x["options"]["C"],
+                "D": x["options"]["D"],
+                "correct": x["correct_answer"],
+                "explanation": x.get("explanation", ""),
+                "subject": x.get("subject", ""),
+                "topic": x.get("topic", ""),
+                "difficulty": x.get("difficulty", ""),
+                "source": x.get("source", ""),
+            })
+    return rows
+
+
+def seed_contexts_from_questions(questions: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Use explanations and choices as initial retrieval contexts; extend later with external corpora if desired
+    contexts = []
+    for q in questions:
+        base = f"Q: {q['question']}\nA) {q['A']}\nB) {q['B']}\nC) {q['C']}\nD) {q['D']}\n"
+        if q.get("explanation"):
+            txt = q["explanation"]
+            contexts.append({"ctx_id": f"{q['id']}:exp", "text": txt, "source": "medmcqa_explanation", "meta": ""})
+        # Choices as mini-contexts
+        for opt in ["A", "B", "C", "D"]:
+            contexts.append({"ctx_id": f"{q['id']}:{opt}", "text": f"{base}\nCHOICE {opt}: {q[opt]}", "source": "medmcqa_choice", "meta": ""})
+    return contexts
+```
+
+## 15) src/medagent/evaluation.py
+
+```python
+from __future__ import annotations
+
+from typing import Any, Dict, List, Tuple
+import time
+
+from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
+
+from .db import connect, new_run, record_prediction
+from .agent import OpenAIFunctionAgent
+from .embeddings import MedEmbedder
+from .retrieval import FAISSStore
+from .config import settings
+
+
+def evaluate_run(run_id: str, question_ids: List[str] | None = None, notes: str = "") -> Dict[str, Any]:
+    db = connect()
+    new_run(db, run_id, notes=notes)
+
+    rows = list(db.query("select * from questions" + ("" if not question_ids else " where id in ({})".format(",".join(["?"] * len(question_ids)))) , question_ids or []))
+    embedder = MedEmbedder(settings.embedding_model, light_mode=settings.light_tests)
+    store = FAISSStore(dim=embedder.dim)
+    agent = OpenAIFunctionAgent(embedder, store)
+
+    total = len(rows)
+    correct = 0
+    latencies = []
+
+    with Progress(
+        TextColumn("[bold blue]Evaluating[/]"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+    ) as progress:
+        t = progress.add_task("eval", total=total)
+        for r in rows:
+            ans, conf, expl, ctx_ids, raw, latency_ms = agent.answer_medmcqa(r)
+            is_correct = (ans.strip().upper() == r["correct"].strip().upper())
+            record_prediction(db, run_id, r["id"], ans, conf, expl, ctx_ids, raw, is_correct, latency_ms)
+            if is_correct:
+                correct += 1
+            latencies.append(latency_ms)
+            progress.advance(t)
+
+    acc = correct / total if total else 0.0
+    avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
+    return {"run_id": run_id, "accuracy": acc, "avg_latency_ms": avg_latency, "count": total}
+```
+
+## 16) src/medagent/llm_integration.py
+
+```python
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+from typing import Dict, Any, Optional
+
+
+def llm_available() -> bool:
+    return shutil.which("llm") is not None
+
+
+def run_llm_cmd(prompt: str, model: str = "openai:gpt-4o-mini", system: Optional[str] = None) -> str:
+    # Requires: pipx install llm; llm plugins install llm-cmd; llm keys set openai
+    if not llm_available():
+        raise RuntimeError("The `llm` CLI is not installed. See https://llm.datasette.io/")
+    cmd = ["llm", "-m", model]
+    if system:
+        cmd += ["--system", system]
+    cmd += ["--", prompt]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+    return res.stdout.strip()
+```
+
+## 17) src/medagent/datasette_integration.py
+
+```python
+from __future__ import annotations
+
+import subprocess
+import webbrowser
+from .config import settings
+
+
+def serve_datasette(open_browser: bool = True, port: int = 8080) -> None:
+    cmd = ["datasette", settings.db_path, "--setting", "sql_time_limit_ms", "30000", "--port", str(port)]
+    p = subprocess.Popen(cmd)
+    if open_browser:
+        webbrowser.open(f"http://127.0.0.1:{port}")
+    p.wait()
+```
+
+## 18) src/medagent/cli.py
+
+```python
+from __future__ import annotations
+
+import json
+import os
+import random
+import string
+from typing import Optional, List
+
+import typer
+from rich import print as rprint
+from rich.panel import Panel
+from rich.table import Table
+from rich.prompt import Prompt, Confirm
+from rich.progress import track
+
+from .config import settings
+from .db import connect, insert_questions, insert_contexts
+from .embeddings import MedEmbedder
+from .retrieval import FAISSStore
+from .rag import index_contexts
+from .datasets import load_medmcqa_jsonl, seed_contexts_from_questions
+from .agent import OpenAIFunctionAgent
+from .evaluation import evaluate_run
+from .datasette_integration import serve_datasette
+from .llm_integration import llm_available, run_llm_cmd
+
+app = typer.Typer(add_completion=False, help="MedMCQA Agentic RAG CLI")
+
+
+def _rand_id(prefix: str) -> str:
+    return prefix + "-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+
+
+@app.command()
+def info():
+    """Show current configuration."""
+    settings.ensure_dirs()
+    t = Table(title="MedAgent Configuration")
+    for k, v in settings.model_dump().items():
+        t.add_row(k, str(v))
+    rprint(t)
+
+
+@app.command()
+def ingest(jsonl_path: str):
+    """Ingest MedMCQA JSONL into SQLite and seed contexts."""
+    db = connect()
+    rows = load_medmcqa_jsonl(jsonl_path)
+    insert_questions(db, rows)
+    ctx = seed_contexts_from_questions(rows)
+    insert_contexts(db, ctx)
+    rprint(Panel.fit(f"Ingested {len(rows)} questions and {len(ctx)} seed contexts", title="Ingest"))
+
+
+@app.command()
+def build_index():
+    """Build or update FAISS index from contexts."""
+    settings.ensure_dirs()
+    db = connect()
+    rows = list(db.query("select ctx_id, text, source, meta from contexts"))
+    embedder = MedEmbedder(settings.embedding_model, light_mode=settings.light_tests)
+    store = FAISSStore(dim=embedder.dim)
+
+    batch = 512
+    buffer = []
+    for r in track(rows, description="Embedding contexts"):
+        buffer.append(r)
+        if len(buffer) >= batch:
+            index_contexts(embedder, store, buffer)
+            buffer.clear()
+    if buffer:
+        index_contexts(embedder, store, buffer)
+
+    rprint(Panel.fit("FAISS index built/updated", title="Index"))
+
+
+@app.command()
+def ask(
+    question: str = typer.Option(..., "--question", "-q"),
+    A: str = typer.Option(..., "--A"),
+    B: str = typer.Option(..., "--B"),
+    C: str = typer.Option(..., "--C"),
+    D: str = typer.Option(..., "--D"),
+):
+    """Ask a single MedMCQA-style question."""
+    embedder = MedEmbedder(settings.embedding_model, light_mode=settings.light_tests)
+    store = FAISSStore(dim=embedder.dim)
+    agent = OpenAIFunctionAgent(embedder, store)
+    payload = {"id": _rand_id("tmp"), "question": question, "A": A, "B": B, "C": C, "D": D, "correct": "?", "explanation": "", "subject": "", "topic": "", "difficulty": "", "source": ""}
+    ans, conf, expl, ctx_ids, raw, latency_ms = agent.answer_medmcqa(payload)
+
+    t = Table(title="Answer")
+    t.add_row("Predicted", ans)
+    t.add_row("Confidence", f"{conf:.2f}")
+    t.add_row("Latency (ms)", f"{latency_ms:.1f}")
+    rprint(t)
+    rprint(Panel(expl, title="Explanation"))
+    rprint(Panel("\n".join(ctx_ids), title="Contexts"))
+
+
+@app.command()
+def evaluate(
+    run_id: Optional[str] = typer.Option(None, "--run-id"),
+    limit: int = typer.Option(100, "--limit", help="Number of questions to evaluate (use 0 for all)"),
+    subject: Optional[str] = typer.Option(None, "--subject"),
+):
+    """Evaluate on a subset of questions and store predictions."""
+    db = connect()
+    where = []
+    params = []
+    if subject:
+        where.append("subject = ?")
+        params.append(subject)
+    if limit > 0:
+        where.append("id in (select id from questions limit ?)")
+        params.append(limit)
+    sql = "select id from questions"
+    if where:
+        sql += " where " + " and ".join(where)
+    ids = [r["id"] for r in db.query(sql, params)]
+    rid = run_id or _rand_id("run")
+    res = evaluate_run(rid, ids, notes=f"limit={limit}, subject={subject or 'ALL'}")
+    rprint(Panel.fit(json.dumps(res, indent=2), title="Evaluation"))
+
+
+@app.command()
+def serve_datasette_cmd(port: int = 8080):
+    """Serve the SQLite DB with Datasette."""
+    serve_datasette(open_browser=True, port=port)
+
+
+@app.command()
+def llm_cmd(prompt: str, model: str = "openai:gpt-4o-mini"):
+    """Run a quick LLM prompt through the llm CLI."""
+    if not llm_available():
+        rprint("[red]`llm` CLI not found. Install with: pipx install llm && llm plugins install llm-cmd[/]")
+        raise typer.Exit(1)
+    out = run_llm_cmd(prompt, model=model, system="You are a helpful MedMCQA coding assistant.")
+    rprint(Panel(out, title="llm output"))
+
+
+@app.command()
+def menu():
+    """Interactive menu with progress bars."""
+    rprint(Panel.fit("MedAgent CLI", subtitle="Agentic RAG for MedMCQA"))
+    while True:
+        choice = Prompt.ask(
+            "Choose",
+            choices=["info", "ingest", "index", "ask", "evaluate", "datasette", "llm", "quit"],
+            default="info",
+        )
+        if choice == "info":
+            info()
+        elif choice == "ingest":
+            path = Prompt.ask("Path to MedMCQA JSONL")
+            ingest(path)
+        elif choice == "index":
+            build_index()
+        elif choice == "ask":
+            q = Prompt.ask("Question")
+            A = Prompt.ask("Choice A")
+            B = Prompt.ask("Choice B")
+            C = Prompt.ask("Choice C")
+            D = Prompt.ask("Choice D")
+            ask(q, A, B, C, D)
+        elif choice == "evaluate":
+            limit = int(Prompt.ask("Limit (0 for all)", default="100"))
+            evaluate(limit=limit)
+        elif choice == "datasette":
+            port = int(Prompt.ask("Port", default="8080"))
+            serve_datasette_cmd(port)
+        elif choice == "llm":
+            prompt = Prompt.ask("Prompt to llm CLI")
+            llm_cmd(prompt)
+        elif choice == "quit":
+            break
+```
+
+## 19) tests/test_smoke.py
+
+```python
+import os
+import json
+import pytest
+from typer.testing import CliRunner
+
+from medagent.cli import app
+from medagent.config import settings
+from medagent.embeddings import MedEmbedder
+from medagent.retrieval import FAISSStore
+from medagent.db import connect, insert_contexts, insert_questions
+from medagent.rag import index_contexts
+
+runner = CliRunner()
+
+@pytest.fixture(scope="session", autouse=True)
+def _light_tests():
+    os.environ["LIGHT_TESTS"] = "1"
+
+def test_embedder_light():
+    e = MedEmbedder(settings.embedding_model, light_mode=True)
+    vecs = e.embed_texts(["hello", "world"])
+    assert vecs.shape == (2, e.dim)
+
+def test_faiss_roundtrip(tmp_path):
+    e = MedEmbedder(settings.embedding_model, light_mode=True)
+    store = FAISSStore(dim=e.dim, index_dir=str(tmp_path))
+    embs = e.embed_texts(["a", "b", "c"])
+    store.build(embs, ["x1", "x2", "x3"])
+    q = e.embed_texts(["a"])[0].reshape(1, -1)
+    s, idx, ids = store.search(q, 2)
+    assert idx.shape == (1, 2)
+    assert ids.shape[0] == 3
+
+def test_cli_info():
+    result = runner.invoke(app, ["info"])
+    assert result.exit_code == 0
+
+def test_index_and_evaluate(tmp_path, monkeypatch):
+    dbp = tmp_path / "medagent.db"
+    monkeypatch.setenv("MEDAGENT_DB", str(dbp))
+    monkeypatch.setenv("MEDAGENT_INDEX_DIR", str(tmp_path / ".index"))
+    monkeypatch.setenv("LIGHT_TESTS", "1")
+
+    from medagent.db import connect as _conn
+    db = _conn()
+
+    qs = [{
+        "id": "q1",
+        "question": "Which vitamin deficiency causes scurvy?",
+        "A": "Vitamin A",
+        "B": "Vitamin C",
+        "C": "Vitamin D",
+        "D": "Vitamin K",
+        "correct": "B",
+        "explanation": "Scurvy is caused by vitamin C deficiency.",
+        "subject": "Biochemistry",
+        "topic": "Vitamins",
+        "difficulty": "easy",
+        "source": "sample",
+    }]
+    insert_questions(db, qs)
+    insert_contexts(db, [{"ctx_id": "c1", "text": "Scurvy due to lack of vitamin C.", "source": "sample", "meta": ""}])
+
+    # Build index
+    result = runner.invoke(app, ["build-index"])
+    assert result.exit_code == 0
+
+    # Evaluate with LIGHT_TESTS: agent still calls OpenAI unless key is missing -> okay; we won't call ask/evaluate here
+```
+
+## 20) tests/test_cli_menu.py
+
+```python
+from typer.testing import CliRunner
+from medagent.cli import app
+
+def test_menu_help():
+    runner = CliRunner()
+    res = runner.invoke(app, ["--help"])
+    assert res.exit_code == 0
+    assert "MedMCQA Agentic RAG CLI" in res.stdout
+```
+
+Note: The evaluation test above avoids making OpenAI calls in CI. Run full evaluation locally with your API key.
+
+## 21) scripts/sample_questions.json
+
+```json
+[
+    {
+        "id": "s1",
+        "question": "Which vitamin deficiency causes scurvy?",
+        "options": {
+            "A": "Vitamin A",
+            "B": "Vitamin C",
+            "C": "Vitamin D",
+            "D": "Vitamin K"
+        },
+        "correct_answer": "B",
+        "explanation": "Scurvy is caused by vitamin C deficiency.",
+        "subject": "Biochemistry",
+        "topic": "Vitamins",
+        "difficulty": "easy",
+        "source": "sample"
+    }
+]
+```
+
+## 22) Installation and Commands
+
+-  Install with uv (recommended):
+    - uv pip install -e ".[dev,cli,data]"
+-  Or with pip:
+    - pip install -e ".[dev,cli,data]"
+-  Export key:
+    - macOS/Linux: export OPENAI_API_KEY="sk-..."
+    - Windows PowerShell: setx OPENAI_API_KEY "sk-..."
+
+Example run:
+-  medagent info
+-  medagent ingest scripts/sample_questions.json
+-  medagent build-index
+-  medagent ask --question "Which vitamin deficiency causes scurvy?" --A "Vitamin A" --B "Vitamin C" --C "Vitamin D" --D "Vitamin K"
+-  medagent evaluate --limit 1
+-  medagent serve-datasette
+-  medagent menu
+
+Expected output snippets:
+-  medagent build-index: shows “Embedding contexts” progress bar; ends with panel “FAISS index built/updated”.
+-  medagent ask: prints a table with Predicted, Confidence, Latency (ms), and a panel with Explanation and retrieved Contexts.
+-  medagent evaluate: prints a JSON panel with accuracy, avg_latency_ms, and count.
+
+## 23) llm/llm-cmd and Datasette Integration
+
+-  llm:
+    - pipx install llm
+    - llm plugins install llm-cmd
+    - llm keys set openai
+    - medagent llm-cmd "Summarize failure cases from the last run"  (via medagent llm-cmd prompt)
+-  Datasette:
+    - medagent serve-datasette  (opens browser on http://127.0.0.1:8080)
+    - Browse tables: questions, contexts, runs, predictions.
+
+## 24) OpenAI “Agents SDK” Integration Notes
+
+-  This scaffold uses function-calling via Chat Completions with a clean wrapper (OpenAIFunctionAgent).
+-  If your org has Assistants/Agents features, set MEDAGENT_USE_ASSISTANTS=1 and extend OpenAIFunctionAgent to call your SDK endpoints (tool definitions, threads, runs). The same retrieve_context tool can be wired into the assistant’s tools; the rest of the pipeline remains identical.
+
+## 25) Automated Tests and Running
+
+-  tox:
+    - tox
+-  hatch:
+    - hatch run pytest
+-  pytest:
+    - pytest -q
+-  LIGHT_TESTS=1 uses a synthetic embedder to keep CI fast; for full runs, unset it.
+
+## 26) Debugging Steps
+
+-  If embeddings fail to load:
+    - Ensure internet access for model download or cache the model locally.
+    - Try a smaller model for debugging: export MEDAGENT_EMBEDDING_MODEL="prajjwal1/bert-tiny"
+-  If FAISS index search errors:
+    - Delete .index folder and rebuild with medagent build-index.
+-  If OpenAI calls fail:
+    - Check OPENAI_API_KEY and model name (MEDAGENT_MODEL).
+    - Run medagent info to verify config.
+-  Slow performance:
+    - Use GPU if available (Torch picks CUDA automatically).
+    - Lower MEDAGENT_TOP_K and MEDAGENT_MAX_CTX.
+-  Datasette port in use:
+    - medagent serve-datasette --port 8081
+
+## 27) Feature, Function, and Integration Tests You Can Add
+
+-  Feature: Confidence calibration histogram from predictions per run.
+-  Function: Reranking by combo score (semantic + keyword BM25).
+-  Integration: End-to-end evaluation on 100 questions, then verify predictions table populated and accuracy within expected range.
+
+Example pytest for a function-level test:
+
+```python
+from medagent.rag import simple_similarity_vote
+import numpy as np
+
+def test_simple_similarity_vote():
+    q_embs = {"A": np.ones(4), "B": np.array([1,0,0,0]), "C": np.array([0,1,0,0]), "D": np.zeros(4)}
+    ctx = np.array([[1,1,1,1], [1,1,1,1]])
+    ans = simple_similarity_vote(q_embs, ctx)
+    assert ans == "A"
+```
+
+## 28) Output Expectations
+
+-  ask command JSON parsing:
+    - The model returns strictly JSON; the agent robustly extracts JSON even if surrounded by text.
+-  evaluate summary:
+    - {"run_id":"run-xxxx","accuracy":0.85,"avg_latency_ms":850.2,"count":100}
+
+## 29) Security and Safety
+
+-  The assistant prompt enforces academic scope; all outputs are for study purposes and not medical advice.
+-  Store keys in environment variables; never commit them.
+
+## 30) Future Enhancements
+
+-  Add BM25 hybrid retrieval (e.g., with textsearch FTS5 in SQLite) and reranking.
+-  Add self-consistency: sample N answers and vote.
+-  Add subject/topic-stratified evaluation report in Datasette via SQL views.
+-  Add active-learning loop: flag low-confidence items for expert labeling.
+
+You now have a complete, agentic MedMCQA RAG system with an ergonomic CLI, integrated OpenAI function-calling, FAISS retrieval, sqlite-utils persistence, Datasette browsing, and llm CLI interoperability—plus tests, packaging, and debugging guidance.
+

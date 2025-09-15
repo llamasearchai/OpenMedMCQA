@@ -1,0 +1,8 @@
+[envs.default]
+dependencies = [".[dev]"]
+env-vars = { LIGHT_TESTS = "1" }
+
+[envs.run]
+dependencies = [".[cli]"]
+
+
